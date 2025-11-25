@@ -1,0 +1,13 @@
+{
+  "name": "Global_Core_Revised",
+  "type": "HLS",
+  "configuration": {
+    "componentType": "HLS",
+    "configFiles": [
+      "hls_config.cfg"
+    ],
+    "work_dir": "Global_Core_Revised"
+  },
+  "useSysrootToolchain": false,
+  "template": "empty_hls_component"
+}

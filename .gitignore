@@ -1,0 +1,29 @@
+
+.cache/
+.Xil/
+.ip/
+
+Global_Core_Revised/
+
+# Vitis Logs and Runtime files
+*.log
+*.jou
+*.str
+dfx_runtime.txt
+compile_commands.json
+
+# Explicit Exclusions
+
+Backups/
+Legacy Testbenches/
+
+# OS & IDE Junk
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Compiled Binaries
+
+*.exe
+*.o
+*.obj
