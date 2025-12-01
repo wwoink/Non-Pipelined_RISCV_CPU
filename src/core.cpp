@@ -89,49 +89,51 @@ void riscv_init() {
 }
 
 // ------------------------------------------------------------
-// Single Step Function (Unified Memory)
+// Helper Functions: Immediate Extractors
 // ------------------------------------------------------------
-void riscv_step(volatile uint32_t* ram) {
-    // AXI Master Interface for RAM
-    #pragma HLS INTERFACE m_axi port=ram offset=off depth=262144 bundle=gmem
-    // AXI Lite Interface for Control
-    #pragma HLS INTERFACE s_axilite port=return
+ap_int<32> sextI(ap_uint<32> insn) {
+    #pragma HLS INLINE
+    ap_int<12> imm12 = (ap_int<12>)(insn >> 20);
+    return (ap_int<32>)imm12;
+}
 
-    // ------------------ Steps for CSR ------------------
-    csr_mcycle++;   // Always increment cycles
-    csr_minstret++;
+ap_int<32> sextS(ap_uint<32> insn) {
+    #pragma HLS INLINE
+    ap_uint<7> hi = insn.range(31,25);
+    ap_uint<5> lo = insn.range(11,7);
+    ap_uint<12> u = ((ap_uint<12>)hi << 5) | (ap_uint<12>)lo;
+    ap_int<12> s = (ap_int<12>)u;
+    return (ap_int<32>)s;
+}
 
-    // ------------------ Immediate extractors ------------------
-    auto sextI = [](ap_uint<32> insn) -> ap_int<32> {
-        ap_int<12> imm12 = (ap_int<12>)(insn >> 20);
-        return (ap_int<32>)imm12;
-    };
-    auto sextS = [](ap_uint<32> insn) -> ap_int<32> {
-        ap_uint<7> hi = insn.range(31,25);
-        ap_uint<5> lo = insn.range(11,7);
-        ap_uint<12> u = ((ap_uint<12>)hi << 5) | (ap_uint<12>)lo;
-        ap_int<12> s = (ap_int<12>)u;
-        return (ap_int<32>)s;
-    };
-    auto sextB = [](ap_uint<32> insn) -> ap_int<32> {
-        ap_uint<13> imm;
-        imm[12]       = insn[31];       
-        imm[11]       = insn[7];        
-        imm.range(10,5) = insn.range(30,25); 
-        imm.range(4,1)  = insn.range(11,8);  
-        imm[0]          = 0;            
-        return (ap_int<32>)((ap_int<13>)imm);
-    };
-    auto sextJ = [](ap_uint<32> insn) -> ap_int<32> {
-        ap_uint<21> u = ((ap_uint<21>)insn[31]        << 20) |
-                        ((ap_uint<21>)insn.range(30,21) << 1 ) |
-                        ((ap_uint<21>)insn[20]        << 11) |
-                        ((ap_uint<21>)insn.range(19,12) << 12);
-        ap_int<21> s = (ap_int<21>)u;
-        return (ap_int<32>)s;
-    };
+ap_int<32> sextB(ap_uint<32> insn) {
+    #pragma HLS INLINE
+    ap_uint<13> imm;
+    imm[12]       = insn[31];       
+    imm[11]       = insn[7];        
+    imm.range(10,5) = insn.range(30,25); 
+    imm.range(4,1)  = insn.range(11,8);  
+    imm[0]          = 0;            
+    return (ap_int<32>)((ap_int<13>)imm);
+}
 
-    // ========== FETCH ==========
+ap_int<32> sextJ(ap_uint<32> insn) {
+    #pragma HLS INLINE
+    ap_uint<21> u = ((ap_uint<21>)insn[31]        << 20) |
+                    ((ap_uint<21>)insn.range(30,21) << 1 ) |
+                    ((ap_uint<21>)insn[20]        << 11) |
+                    ((ap_uint<21>)insn.range(19,12) << 12);
+    ap_int<21> s = (ap_int<21>)u;
+    return (ap_int<32>)s;
+}
+
+// ------------------------------------------------------------
+// Pipeline Stages
+// ------------------------------------------------------------
+
+// Returns the fetched instruction
+ap_uint<32> fetch(volatile uint32_t* ram) {
+    #pragma HLS INLINE off
     uint32_t phys_pc = pc & 0x000FFFFF; 
     uint32_t im_idx = (phys_pc - (DRAM_BASE & 0x000FFFFF)) >> 2;
     
@@ -148,8 +150,12 @@ void riscv_step(volatile uint32_t* ram) {
         std::cout << "[FETCH] PC=0x" << std::hex << (unsigned)pc 
                   << " Instr=0x" << (unsigned)IF_ID_instr << std::dec << "\n";
     }
+    return IF_ID_instr;
+}
 
-    // ========== DECODE ==========
+// Returns the opcode decoded
+ap_uint<7> decode() {
+    #pragma HLS INLINE off
     ap_uint<32> instr = IF_ID_instr; 
     ID_EX_opcode = instr.range(6, 0);
     ID_EX_rd     = instr.range(11, 7);
@@ -175,8 +181,12 @@ void riscv_step(volatile uint32_t* ram) {
         std::cout << "[DECODE] Opcode=0x" << std::hex << (int)ID_EX_opcode 
                   << " Rd=" << (int)ID_EX_rd << std::dec << "\n";
     }
+    return ID_EX_opcode;
+}
 
-    // ========== EXECUTE ==========
+// Returns the ALU result
+ap_int<32> execute() {
+    #pragma HLS INLINE off
     ap_int<32> rs1_val = ID_EX_rs1_val;
     ap_int<32> rs2_val = ID_EX_rs2_val;
 
@@ -444,8 +454,12 @@ void riscv_step(volatile uint32_t* ram) {
     if (CORE_DEBUG) {
         std::cout << "[EXEC] ALU=0x" << std::hex << (int)EX_MEM_alu_result << std::dec << "\n";
     }
+    return EX_MEM_alu_result;
+}
 
-    // ========== MEMORY (UNIFIED & MISALIGNED SUPPORT) ==========
+// Returns the value that would be written to register (or loaded val)
+ap_int<32> memory(volatile uint32_t* ram) {
+    #pragma HLS INLINE off
     MEM_WB_is_trap = EX_MEM_is_trap; 
     if (EX_MEM_is_trap) {
         EX_MEM_mem_read = false;
@@ -535,13 +549,46 @@ void riscv_step(volatile uint32_t* ram) {
             if(CORE_DEBUG) std::cout << "[MEM] Stored 0x" << std::hex << (int)EX_MEM_store_val << " to 0x" << ea_u << std::dec << "\n";
         }
     }
+    return MEM_WB_value;
+}
 
-    // ========== WRITEBACK ==========
+// Returns the value written to register (for debug/pipeline tracking)
+ap_int<32> writeback() {
+    #pragma HLS INLINE off
+    ap_int<32> wb_val = 0;
     if (MEM_WB_reg_write && MEM_WB_rd != 0 && !MEM_WB_is_trap) {
         regfile[MEM_WB_rd] = MEM_WB_value;
+        wb_val = MEM_WB_value;
         if(CORE_DEBUG) std::cout << "[WB] x" << (int)MEM_WB_rd << " <= 0x" << std::hex << (int)MEM_WB_value << std::dec << "\n";
     }
     regfile[0] = 0; 
+    return wb_val;
+}
+
+// ------------------------------------------------------------
+// Single Step Function (Unified Memory)
+// ------------------------------------------------------------
+void riscv_step(volatile uint32_t* ram) {
+    // AXI Master Interface for RAM
+    #pragma HLS INTERFACE m_axi port=ram offset=off depth=262144 bundle=gmem
+    // AXI Lite Interface for Control
+    #pragma HLS INTERFACE s_axilite port=return
+
+    // ------------------ Steps for CSR ------------------
+    csr_mcycle++;   // Always increment cycles
+    csr_minstret++;
+
+    // ------------------ Call Stages ------------------
+    // We capture returns to prevent HLS optimization from pruning "unused" logic,
+    ap_uint<32> f_out = fetch(ram);
+    ap_uint<7>  d_out = decode();
+    ap_int<32>  e_out = execute();
+    ap_int<32>  m_out = memory(ram);
+    ap_int<32>  w_out = writeback();
+
+    // Create a dummy dependency chain to force HLS to keep these paths active
+    // The volatile keyword prevents this calculation from being optimized away completely.
+    volatile int dummy_accumulator = (int)f_out ^ (int)d_out ^ (int)e_out ^ (int)m_out ^ (int)w_out;
 
     // ========== NEXT PC ==========
     if (took_branch_or_jump) {
