@@ -327,7 +327,8 @@ void riscv_step(volatile uint32_t* ram) {
 
         switch ((unsigned)ID_EX_funct3) {
             case 0x0: // ECALL / EBREAK
-                if (ID_EX_imm == 0x000) { EX_MEM_is_trap = true; trap_cause = 11; }
+                if (ID_EX_imm == 0x000) { EX_MEM_is_trap = true; trap_cause = 11; } // ECALL
+                else if (ID_EX_imm == 0x001) { EX_MEM_is_trap = true; trap_cause = 3; } // EBREAK
                 break;
             case 0x1: // CSRRW
                 EX_MEM_alu_result = csr_read_val; 
@@ -347,6 +348,19 @@ void riscv_step(volatile uint32_t* ram) {
                     switch (csr_addr) {
                         case 0x305: csr_mtvec = new_val; break;
                         case 0x341: csr_mepc  = new_val; break;
+                        case 0x342: csr_mcause = new_val; break;
+                        case 0x300: csr_mstatus = new_val; break;
+                    }
+                }
+                break;
+            case 0x3: // CSRRC (Atomic Read and Clear Bits)
+                EX_MEM_alu_result = csr_read_val;
+                EX_MEM_reg_write = (ID_EX_rd != 0);
+                if (ID_EX_rs1 != 0) {
+                    ap_uint<32> new_val = csr_read_val & ~rs1_val;
+                    switch (csr_addr) {
+                        case 0x305: csr_mtvec = new_val; break;
+                        case 0x341: csr_mepc = new_val; break;
                         case 0x342: csr_mcause = new_val; break;
                         case 0x300: csr_mstatus = new_val; break;
                     }
