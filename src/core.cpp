@@ -55,6 +55,10 @@ ap_uint<32> csr_mtvec = 0;
 ap_uint<32> csr_mepc = 0;
 ap_uint<32> csr_mcause = 0;
 
+ap_uint<32> csr_mcycle = 0;   // Cycle Counter (0xB00)
+ap_uint<32> csr_minstret = 0; // Instructions Retired (0xB02)
+ap_uint<32> csr_mstatus = 0;  // Status Register (0x300)
+
 // --- Global Variable Master Definitions ---
 ap_uint<32> ENTRY_PC;
 
@@ -78,6 +82,10 @@ void riscv_init() {
     took_branch_or_jump = false;
     EX_MEM_is_trap = false;
     MEM_WB_is_trap = false;
+
+    csr_mcycle = 0;
+    csr_minstret = 0;
+    csr_mstatus = 0;
 }
 
 // ------------------------------------------------------------
@@ -88,6 +96,10 @@ void riscv_step(volatile uint32_t* ram) {
     #pragma HLS INTERFACE m_axi port=ram offset=off depth=262144 bundle=gmem
     // AXI Lite Interface for Control
     #pragma HLS INTERFACE s_axilite port=return
+
+    // ------------------ Steps for CSR ------------------
+    csr_mcycle++;   // Always increment cycles
+    csr_minstret++;
 
     // ------------------ Immediate extractors ------------------
     auto sextI = [](ap_uint<32> insn) -> ap_int<32> {
@@ -302,6 +314,12 @@ void riscv_step(volatile uint32_t* ram) {
             case 0x305: csr_read_val = csr_mtvec; break;
             case 0x341: csr_read_val = csr_mepc; break;
             case 0x342: csr_read_val = csr_mcause; break;
+            case 0xB00: csr_read_val = csr_mcycle; break;   // mcycle
+            case 0xC00: csr_read_val = csr_mcycle; break;   // cycle (user alias)
+            case 0xB02: csr_read_val = csr_minstret; break; // minstret
+            case 0xC02: csr_read_val = csr_minstret; break; // instret (user alias)
+            case 0xF14: csr_read_val = 0; break;            // mhartid (Core 0)
+            case 0x300: csr_read_val = csr_mstatus; break;  // mstatus
             default:    csr_read_val = 0; break;
         }
         
@@ -318,6 +336,7 @@ void riscv_step(volatile uint32_t* ram) {
                     case 0x305: csr_mtvec = rs1_val; break;
                     case 0x341: csr_mepc  = rs1_val; break;
                     case 0x342: csr_mcause = rs1_val; break;
+                    case 0x300: csr_mstatus = rs1_val; break;
                 }
                 break;
             case 0x2: // CSRRS
@@ -329,6 +348,7 @@ void riscv_step(volatile uint32_t* ram) {
                         case 0x305: csr_mtvec = new_val; break;
                         case 0x341: csr_mepc  = new_val; break;
                         case 0x342: csr_mcause = new_val; break;
+                        case 0x300: csr_mstatus = new_val; break;
                     }
                 }
                 break;
@@ -339,6 +359,7 @@ void riscv_step(volatile uint32_t* ram) {
                     case 0x305: csr_mtvec = (ap_uint<32>)rs1_imm; break;
                     case 0x341: csr_mepc  = (ap_uint<32>)rs1_imm; break;
                     case 0x342: csr_mcause = (ap_uint<32>)rs1_imm; break;
+                    case 0x300: csr_mstatus = (ap_uint<32>)rs1_imm; break;
                 }
                 break;
             case 0x6: // CSRRSI
@@ -350,6 +371,7 @@ void riscv_step(volatile uint32_t* ram) {
                         case 0x305: csr_mtvec = new_val; break;
                         case 0x341: csr_mepc  = new_val; break;
                         case 0x342: csr_mcause = new_val; break;
+                        case 0x300: csr_mstatus = new_val; break;
                     }
                 }
                 break;
@@ -362,6 +384,7 @@ void riscv_step(volatile uint32_t* ram) {
                         case 0x305: csr_mtvec = new_val; break;
                         case 0x341: csr_mepc  = new_val; break;
                         case 0x342: csr_mcause = new_val; break;
+                        case 0x300: csr_mstatus = new_val; break;
                     }
                 }
                 break;

@@ -22,6 +22,7 @@
 // --- Configuration ---
 // Increase if needed.
 #define TEST_TIMEOUT   5000000 
+const bool ENABLE_CORE_DEBUG = false;
 
 // --- Unified Memory Array ---
 ap_uint<32> ram[RAM_SIZE]; 
@@ -98,7 +99,7 @@ int main(int argc, char* argv[])
         }
 
         // 4. Init Core
-        CORE_DEBUG = false; // Keep logs clean
+        CORE_DEBUG = ENABLE_CORE_DEBUG; // Keep logs clean
         riscv_init();
 
         // 5. Run Simulation
@@ -114,6 +115,16 @@ int main(int argc, char* argv[])
             if (tohost != 0) {
                 // ACK the write by clearing memory (Important for benchmarks)
                 ram[tohost_idx] = 0;
+
+                // If this is NOT an exit command (LSB is 0), it's a syscall/print.
+                // We must write 1 to 'fromhost' (offset 0x40 from tohost) to signal completion.
+                // 0x40 bytes = 16 words.
+                if ((tohost & 1) == 0) {
+                    unsigned fromhost_idx = tohost_idx + 16; // 0x40 / 4 = 16
+                    if (fromhost_idx < RAM_SIZE) {
+                        ram[fromhost_idx] = 1; 
+                    }
+                }
 
                 // Logic: LSB 1 = Exit, LSB 0 = Syscall
                 if (tohost & 1) {

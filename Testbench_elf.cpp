@@ -21,7 +21,7 @@
 // ============================================================================
 
 // 1. Execution Limit (Prevent infinite loops)
-#define INSTRUCTION_LIMIT 10000000 
+#define INSTRUCTION_LIMIT 1000000 
 
 // 2. Instruction Trace: Set TRUE to print every instruction (Opcode, Regs, ALU)
 const bool ENABLE_CORE_DEBUG = false;
@@ -71,17 +71,30 @@ int main(int argc, char* argv[])
     bool done = false;
 
     for (int i = 0; i < INSTRUCTION_LIMIT; i++) {
-        
+        if (i >= INSTRUCTION_LIMIT - 1000) {
+            CORE_DEBUG = true;
+        }
+
         riscv_step((volatile uint32_t*)ram);
 
-        uint32_t tohost_val = ram[tohost_idx];
+        uint32_t tohost = ram[tohost_idx];
 
-        if (tohost_val != 0) {
+        if (tohost != 0) {
             ram[tohost_idx] = 0; // ACK writes
+
+            // If this is NOT an exit command (LSB is 0), it's a syscall/print.
+            // We must write 1 to 'fromhost' (offset 0x40 from tohost) to signal completion.
+            // 0x40 bytes = 16 words.
+            if ((tohost & 1) == 0) {
+                unsigned fromhost_idx = tohost_idx + 16; // 0x40 / 4 = 16
+                if (fromhost_idx < RAM_SIZE) {
+                    ram[fromhost_idx] = 1; 
+                }
+            }
             
             // Check LSB for Exit Code
-            if (tohost_val & 1) { 
-                int exit_code = tohost_val >> 1;
+            if (tohost & 1) { 
+                int exit_code = tohost >> 1;
                 if (exit_code == 0) {
                     std::cout << "[TESTBENCH] PASS at cycle " << i << "\n";
                     passed = true;

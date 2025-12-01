@@ -15,6 +15,8 @@ static constexpr size_t E_SHOFF     = 0x20;
 static constexpr size_t E_SHENTSIZE = 0x2E;
 static constexpr size_t E_SHNUM     = 0x30;
 static constexpr size_t E_SHSTRNDX  = 0x32;
+static constexpr size_t E_PHOFF     = 0x1C; // Program Header Offset
+static constexpr size_t E_PHNUM     = 0x2C; // Number of Program Headers
 
 template<unsigned N> constexpr size_t little_endian(const uint8_t *bytes){
     return (bytes[N-1] << 8 * (N-1)) | little_endian<N-1>(bytes);
@@ -173,7 +175,7 @@ inline void ElfFile::fillSymbolsName() {
 }
 
 // Unified Load Logic
-inline ap_uint<32> ElfFile::load_to_mem(ap_uint<32> ram_ptr[], int ram_depth) {
+/*inline ap_uint<32> ElfFile::load_to_mem(ap_uint<32> ram_ptr[], int ram_depth) {
     const auto entry_pc = little_endian<4>(&content[0x18]);
     uint32_t DRAM_BASE_ADDR = 0x80000000;
 
@@ -201,6 +203,79 @@ inline ap_uint<32> ElfFile::load_to_mem(ap_uint<32> ram_ptr[], int ram_depth) {
     }
     //std::cout << "[ELF] Entry PC = 0x" << std::hex << entry_pc << std::dec << "\n";
     return (ap_uint<32>)entry_pc & 0xFFFFFFFF;
+}*/
+// Unified Load Logic (Segment-Based Loading)
+inline ap_uint<32> ElfFile::load_to_mem(ap_uint<32> ram_ptr[], int ram_depth) {
+    const auto entry_pc = little_endian<4>(&content[0x18]);
+    uint32_t DRAM_BASE_ADDR = 0x80000000;
+
+    // ---------------------------------------------------------
+    // STEP 1: Scan Sections ONLY to find .tohost address
+    // ---------------------------------------------------------
+    this->tohost_addr_found = 0;
+    for (const auto& sec : sectionTable) {
+        if (sec.name == ".tohost") {
+            this->tohost_addr_found = sec.address;
+            // std::cout << "[ELF] Found .tohost at 0x" << std::hex << sec.address << "\n";
+        }
+    }
+
+    // ---------------------------------------------------------
+    // STEP 2: Load Data using Program Headers (Segments)
+    // ---------------------------------------------------------
+    const auto ph_off = little_endian<4>(&content[E_PHOFF]);
+    const auto ph_num = little_endian<2>(&content[E_PHNUM]);
+    
+    const auto* ph_table = reinterpret_cast<const Elf32_Phdr*>(&content[ph_off]);
+
+    for (int i = 0; i < ph_num; i++) {
+        const Elf32_Phdr& ph = ph_table[i];
+
+        // We only care about Loadable Segments with a non-zero memory size
+        if (ph.p_type == PT_LOAD && ph.p_memsz > 0) {
+            
+            // Calculate RAM Index
+            uint32_t phys_addr = ph.p_paddr; 
+            
+            // Safety check: Ensure address is within DRAM range
+            if (phys_addr < DRAM_BASE_ADDR) continue;
+
+            size_t start_idx = (phys_addr - DRAM_BASE_ADDR) >> 2;
+            
+            // Bounds check
+            if (start_idx >= (size_t)ram_depth) {
+                std::cerr << "[ELF] Warning: Segment 0x" << std::hex << phys_addr 
+                          << " is outside RAM bounds.\n";
+                continue;
+            }
+
+            // 1. Copy File Data (Code/Data/Rodata)
+            if (ph.p_filesz > 0) {
+                // memcpy writes bytes; ram_ptr is 32-bit words. 
+                // &ram_ptr[start_idx] gives the byte address of that word.
+                memcpy(&ram_ptr[start_idx], &content[ph.p_offset], ph.p_filesz);
+            }
+
+            // 2. Handle BSS (Zero-init remaining memory)
+            // If MemSize > FileSize, the rest is BSS and must be zeroed.
+            if (ph.p_memsz > ph.p_filesz) {
+                size_t bss_size = ph.p_memsz - ph.p_filesz;
+                // Calculate byte offset where BSS starts
+                uint8_t* ram_byte_ptr = (uint8_t*)ram_ptr;
+                size_t bss_start_byte_idx = (start_idx * 4) + ph.p_filesz;
+                
+                memset(&ram_byte_ptr[bss_start_byte_idx], 0, bss_size);
+            }
+
+            /* Debug Output
+            std::cout << "[ELF] Loaded Segment: Phys=0x" << std::hex << phys_addr
+                      << " FileSz=0x" << ph.p_filesz 
+                      << " MemSz=0x" << ph.p_memsz << "\n";
+            */
+        }
+    }
+
+    return (ap_uint<32>)entry_pc;
 }
 
 #endif
