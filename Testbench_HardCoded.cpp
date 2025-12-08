@@ -20,13 +20,16 @@
 //  USER CONFIGURATION SWITCHES
 // ============================================================================
 
-// 1. Execution Limit
-#define INSTRUCTION_LIMIT 1000000 
+// 1. Hardcoded Path
+#define ELF_PATH "I:/Vitis_Files/Pipeline_Tests/Global_Core_Revised/Benchmarks/rv32ui-p-benchmarks/rsort.riscv"
 
-// 2. NEW: Batch Size
+// 2. Execution Limit (Total Cycles)
+#define INSTRUCTION_LIMIT 500000 
+
+// 3. Batch Size (New: How many cycles to run per hardware call)
 #define BATCH_SIZE 5000
 
-// 3. Debug Switches
+// 4. Debug Switches
 const bool ENABLE_CORE_DEBUG = false;
 const bool ENABLE_MEMORY_INSPECTION = false; 
 
@@ -36,23 +39,28 @@ const bool ENABLE_MEMORY_INSPECTION = false;
 ap_uint<32> ram[RAM_SIZE];
 
 extern void riscv_init();
-// UPDATED SIGNATURE
+// UPDATED SIGNATURE: Now accepts the cycle count
 extern void riscv_step(volatile uint32_t* ram, int cycles);
 
 int main(int argc, char* argv[])
 {
-    const char* elf_filename = "rsort.riscv";
-    if (argc > 1) elf_filename = argv[1];
+    const char* elf_filename = ELF_PATH;
 
     std::cout << "[TESTBENCH] Loading ELF: " << elf_filename << "\n";
     
+    // Clear Memory
     memset(ram, 0, sizeof(ram));
 
-    // Use the shared class from elfFile.h
+    // Load ELF
     ElfFile loader(elf_filename);
     ENTRY_PC = loader.load_to_mem(ram, RAM_SIZE);
 
-    // DYNAMIC TOHOST CALCULATION
+    if (ENTRY_PC == 0) {
+        std::cout << "[TESTBENCH] CRITICAL ERROR: Could not load ELF (ENTRY_PC is 0).\n";
+        return 1; 
+    }
+
+    // Dynamic Tohost Calculation
     unsigned tohost_idx = 0;
     if (loader.tohost_addr_found != 0) {
         tohost_idx = (loader.tohost_addr_found - DRAM_BASE) >> 2;
@@ -74,15 +82,11 @@ int main(int argc, char* argv[])
     bool passed = false;
     bool done = false;
 
-    // UPDATED LOOP: Increment by BATCH_SIZE
+    // UPDATED LOOP: Steps by BATCH_SIZE
     for (int i = 0; i < INSTRUCTION_LIMIT; i += BATCH_SIZE) {
         
-        // Debug logic adjusted for batching (turn on near end)
-        if (i >= INSTRUCTION_LIMIT - 10000) {
-            // CORE_DEBUG = true; 
-        }
-
-        // RUN BATCH
+        // --- RUN BATCH ---
+        // This runs 5000 cycles in hardware before returning
         riscv_step((volatile uint32_t*)ram, BATCH_SIZE);
 
         uint32_t tohost = ram[tohost_idx];
@@ -90,21 +94,24 @@ int main(int argc, char* argv[])
         if (tohost != 0) {
             ram[tohost_idx] = 0; // ACK writes
 
+            // Handle Syscalls (LSB 0)
             if ((tohost & 1) == 0) {
-                unsigned fromhost_idx = tohost_idx + 16; 
+                unsigned fromhost_idx = tohost_idx + 16;
                 if (fromhost_idx < RAM_SIZE) {
                     ram[fromhost_idx] = 1; 
                 }
             }
             
-            // Check LSB for Exit Code
+            // Handle Exit (LSB 1)
             if (tohost & 1) { 
                 int exit_code = tohost >> 1;
                 if (exit_code == 0) {
+                    // Note: 'i' is the start of the batch, so we say "approx"
                     std::cout << "[TESTBENCH] PASS at approx cycle " << i << "\n";
                     passed = true;
                 } else {
                     std::cout << "[TESTBENCH] FAIL (Code: " << exit_code << ") at approx cycle " << i << "\n";
+                    passed = false;
                 }
                 done = true;
                 break;
@@ -112,35 +119,34 @@ int main(int argc, char* argv[])
         }
     }
 
-    if (!done) std::cout << "[TESTBENCH] TIMEOUT\n";
+    if (!done) {
+        std::cout << "[TESTBENCH] TIMEOUT (Reached " << INSTRUCTION_LIMIT << " cycles)\n";
+        passed = false;
+    }
 
     // ================================================================
-    // MEMORY INSPECTION (Using Configuration Switch)
-    // Note: data_addr is specific to 'rsort.riscv'. Update for other files (This is disabled by default).
+    // MEMORY INSPECTION 
     // ================================================================
     if (passed && ENABLE_MEMORY_INSPECTION) {
         std::cout << "\n[INSPECTION] Checking 'input_data' array in memory...\n";
-        
-        // Force the address of <input_data> from your dump file
         uint32_t data_addr = 0x80005d94; 
-
+        
         if (data_addr != 0) {
-            // Convert to RAM Index: (Address - Base) / 4
             unsigned ram_idx = (data_addr - DRAM_BASE) >> 2;
-            
-            std::cout << "Reading from 0x" << std::hex << data_addr << std::dec << " (RAM Index " << ram_idx << ")\n";
-            std::cout << "These values MUST be sorted (Low -> High):\n";
-            std::cout << "----------------------------------------\n";
-            
+            std::cout << "Reading from 0x" << std::hex << data_addr << std::dec << "\n";
             for (int k = 0; k < 20; k++) {
                 if (ram_idx + k < RAM_SIZE) {
                     int value = (int)ram[ram_idx + k];
                     std::cout << "[" << k << "] " << value << "\n";
                 }
             }
-            std::cout << "----------------------------------------\n";
         }
     }
 
-    return 0;
+    // FINAL VITIS STATUS CHECK
+    if (passed) {
+        return 0; // SUCCESS 
+    } else {
+        return 1; // FAILURE 
+    }
 }

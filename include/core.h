@@ -27,6 +27,6 @@ void riscv_init();
 
 // Unified Memory Step Function
 // Now accepts a volatile pointer to memory (AXI Master)
-void riscv_step(volatile uint32_t* ram);
+void riscv_step(volatile uint32_t* ram, int cycles);
 
 #endif // CORE_H

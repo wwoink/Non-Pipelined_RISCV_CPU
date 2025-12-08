@@ -19,16 +19,30 @@
 // --- OS Specific Headers (Batch Runner Only) ---
 #include <windows.h> // Required for directory scanning (FindFirstFile)
 
-// --- Configuration ---
-// Increase if needed.
+// ============================================================================
+//  USER CONFIGURATION SWITCHES
+// ============================================================================
+
+// 1. Execution Limit (Prevent infinite loops)
+//    Increased to accommodate larger benchmarks if needed
 #define TEST_TIMEOUT   5000000 
+
+// 2. NEW: Batch Size
+//    How many cycles the hardware runs per call. 
+//    Higher = Faster simulation, Less "Heartbeat" updates. Longer time between knowing if the program is complete
+#define BATCH_SIZE     5000    
+
+// 3. Debug Switch
 const bool ENABLE_CORE_DEBUG = false;
 
-// --- Unified Memory Array ---
+// ============================================================================
+
+// UNIFIED RAM ARRAY
 ap_uint<32> ram[RAM_SIZE]; 
 
 extern void riscv_init();
-extern void riscv_step(volatile uint32_t* ram); 
+// UPDATED SIGNATURE: Accepts cycle count
+extern void riscv_step(volatile uint32_t* ram, int cycles); 
 
 // ============================================================================
 // Directory Scanner (Windows)
@@ -75,7 +89,7 @@ int main(int argc, char* argv[])
     int total_fail = 0;
     
     std::cout << "\n==================================================================\n";
-    std::cout << "  RISC-V REGRESSION RUNNER  \n";
+    std::cout << "  RISC-V REGRESSION RUNNER (BATCH MODE) \n";
     std::cout << "==================================================================\n";
 
     for (const auto& test_name : tests) {
@@ -104,10 +118,12 @@ int main(int argc, char* argv[])
 
         // 5. Run Simulation
         bool finished = false;
-        for (int i = 0; i < TEST_TIMEOUT; i++) {
+        
+        // --- UPDATED LOOP: Steps by BATCH_SIZE ---
+        for (int i = 0; i < TEST_TIMEOUT; i += BATCH_SIZE) {
             
-            // Step Core
-            riscv_step((volatile uint32_t*)ram);
+            // RUN BATCH: Hardware runs 5000 cycles internally
+            riscv_step((volatile uint32_t*)ram, BATCH_SIZE);
             
             // Check Host Interface
             uint32_t tohost = ram[tohost_idx];

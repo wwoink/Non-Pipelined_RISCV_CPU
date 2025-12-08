@@ -566,35 +566,41 @@ ap_int<32> writeback() {
 }
 
 // ------------------------------------------------------------
-// Single Step Function (Unified Memory)
+// Modified Step function within a loop (Unified Memory)
 // ------------------------------------------------------------
-void riscv_step(volatile uint32_t* ram) {
+void riscv_step(volatile uint32_t* ram, int cycles) {
     // AXI Master Interface for RAM
     #pragma HLS INTERFACE m_axi port=ram offset=off depth=262144 bundle=gmem
+    // Cycle Counter
+    #pragma HLS INTERFACE s_axilite port=cycles
     // AXI Lite Interface for Control
     #pragma HLS INTERFACE s_axilite port=return
 
-    // ------------------ Steps for CSR ------------------
-    csr_mcycle++;   // Always increment cycles
-    csr_minstret++;
+    INSTRUCTION_LOOP: for (int i = 0; i < cycles; i++) {
+        #pragma HLS LOOP_TRIPCOUNT min=50 max=500000
 
-    // ------------------ Call Stages ------------------
-    // We capture returns to prevent HLS optimization from pruning "unused" logic,
-    ap_uint<32> f_out = fetch(ram);
-    ap_uint<7>  d_out = decode();
-    ap_int<32>  e_out = execute();
-    ap_int<32>  m_out = memory(ram);
-    ap_int<32>  w_out = writeback();
+        // ------------------ Steps for CSR ------------------
+        csr_mcycle++;   // Always increment cycles
+        csr_minstret++;
 
-    // Create a dummy dependency chain to force HLS to keep these paths active
-    // The volatile keyword prevents this calculation from being optimized away completely.
-    volatile int dummy_accumulator = (int)f_out ^ (int)d_out ^ (int)e_out ^ (int)m_out ^ (int)w_out;
+        // ------------------ Call Stages ------------------
+        // We capture returns to prevent HLS optimization from pruning "unused" logic,
+        ap_uint<32> f_out = fetch(ram);
+        ap_uint<7>  d_out = decode();
+        ap_int<32>  e_out = execute();
+        ap_int<32>  m_out = memory(ram);
+        ap_int<32>  w_out = writeback();
 
-    // ========== NEXT PC ==========
-    if (took_branch_or_jump) {
-        pc = next_pc;
-        took_branch_or_jump = false;  
-    } else {
-        pc += 4;
+        // Create a dummy dependency chain to force HLS to keep these paths active
+        // The volatile keyword prevents this calculation from being optimized away completely.
+        volatile int dummy_accumulator = (int)f_out ^ (int)d_out ^ (int)e_out ^ (int)m_out ^ (int)w_out;
+
+        // ========== NEXT PC ==========
+        if (took_branch_or_jump) {
+            pc = next_pc;
+            took_branch_or_jump = false;  
+        } else {
+            pc += 4;
+        }
     }
 }
