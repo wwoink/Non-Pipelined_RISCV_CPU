@@ -6,13 +6,25 @@
 // ------------------------------------------------------------
 // Global Debug Switch
 // ------------------------------------------------------------
-bool CORE_DEBUG = false;
+bool CORE_DEBUG = true; // This must be toggled in the testbench
+
+// ------------------------------------------------------------  
+// Global Configuration Switch
+// ------------------------------------------------------------
+// If false, the M-extension logic is completely pruned during synthesis.
+const bool ENABLE_M_EXTENSION = true;
+const bool ENABLE_A_EXTENSION = true; // Toggle for Atomics
 
 // ------------------------------------------------------------
 // Global Architectural State
 // ------------------------------------------------------------
 ap_uint<32> pc = 0;
 ap_int<32>  regfile[32];
+bool is_finished = false;
+
+// --- Load Reserved / Store Conditional State ---
+ap_uint<32> lr_addr = 0;
+bool lr_valid = false;
 
 // ------------------------------------------------------------
 // Global pipeline registers
@@ -42,6 +54,10 @@ ap_uint<3>  EX_MEM_funct3 = 0;
 ap_int<32>  EX_MEM_store_val = 0;
 bool        EX_MEM_is_trap = false; 
 
+// --- New Pipeline Regs for Atomics ---
+bool        EX_MEM_is_atomic = false;
+ap_uint<5>  EX_MEM_atomic_op = 0;
+
 ap_int<32>  MEM_WB_value = 0;
 ap_uint<5>  MEM_WB_rd = 0;
 bool        MEM_WB_reg_write = 0;
@@ -54,10 +70,17 @@ ap_uint<32> next_pc               = 0;
 ap_uint<32> csr_mtvec = 0;
 ap_uint<32> csr_mepc = 0;
 ap_uint<32> csr_mcause = 0;
+ap_uint<32> csr_mscratch = 0;
 
 ap_uint<32> csr_mcycle = 0;   // Cycle Counter (0xB00)
 ap_uint<32> csr_minstret = 0; // Instructions Retired (0xB02)
 ap_uint<32> csr_mstatus = 0;  // Status Register (0x300)
+
+// --- Interrupts & Timer (TASK 3 ADDITION) ---
+ap_uint<32> csr_mie = 0; // Interrupt Enable Register (0x304)
+ap_uint<32> csr_mip = 0; // Interrupt Pending Register (0x344)
+// The CLINT (Core Local Interruptor) requires a 64-bit timer comparison
+ap_uint<64> mtimecmp = 0xFFFFFFFFFFFFFFFF;
 
 // --- Global Variable Master Definitions ---
 ap_uint<32> ENTRY_PC;
@@ -82,10 +105,20 @@ void riscv_init() {
     took_branch_or_jump = false;
     EX_MEM_is_trap = false;
     MEM_WB_is_trap = false;
+    is_finished = false; // Reset the finished flag
 
     csr_mcycle = 0;
     csr_minstret = 0;
     csr_mstatus = 0;
+    
+    // Reset Timer state
+    csr_mie = 0;
+    csr_mip = 0;
+    mtimecmp = 0xFFFFFFFFFFFFFFFF;
+
+    // Reset Atomic State
+    lr_valid = false;
+    lr_addr = 0;
 }
 
 // ------------------------------------------------------------
@@ -133,7 +166,7 @@ ap_int<32> sextJ(ap_uint<32> insn) {
 
 // Returns the fetched instruction
 ap_uint<32> fetch(volatile uint32_t* ram) {
-    #pragma HLS INLINE off
+    #pragma HLS INLINE
     uint32_t phys_pc = pc & 0x000FFFFF; 
     uint32_t im_idx = (phys_pc - (DRAM_BASE & 0x000FFFFF)) >> 2;
     
@@ -155,7 +188,7 @@ ap_uint<32> fetch(volatile uint32_t* ram) {
 
 // Returns the opcode decoded
 ap_uint<7> decode() {
-    #pragma HLS INLINE off
+    #pragma HLS INLINE
     ap_uint<32> instr = IF_ID_instr; 
     ID_EX_opcode = instr.range(6, 0);
     ID_EX_rd     = instr.range(11, 7);
@@ -170,6 +203,7 @@ ap_uint<7> decode() {
         case 0x23: ID_EX_imm = sextS(instr); break; // Store
         case 0x63: ID_EX_imm = sextB(instr); break; // Branch
         case 0x6F: ID_EX_imm = sextJ(instr); break; // JAL
+        case 0x2F: ID_EX_imm = 0; break;            // Atomics (No immediate)
         default:   ID_EX_imm = sextI(instr); break; // All others (I-type, JALR, Load, ALU-I)
     }
     
@@ -186,7 +220,7 @@ ap_uint<7> decode() {
 
 // Returns the ALU result
 ap_int<32> execute() {
-    #pragma HLS INLINE off
+    #pragma HLS INLINE
     ap_int<32> rs1_val = ID_EX_rs1_val;
     ap_int<32> rs2_val = ID_EX_rs2_val;
 
@@ -199,7 +233,27 @@ ap_int<32> execute() {
     EX_MEM_funct3     = ID_EX_funct3;
     EX_MEM_is_trap    = false; 
 
+    EX_MEM_is_atomic  = false;
+    EX_MEM_atomic_op  = 0;
+
     switch ((unsigned)ID_EX_opcode) {
+    case 0x2F: { // A-Extension (Atomics)
+        if (ENABLE_A_EXTENSION) {
+            // funct3 must be 0x2 (32-bit word) for RV32A
+            if (ID_EX_funct3 == 0x2) {
+                EX_MEM_is_atomic = true;
+                EX_MEM_atomic_op = ID_EX_funct7.range(6, 2); // Extract top 5 bits
+                EX_MEM_alu_result = rs1_val; // Memory Address
+                EX_MEM_store_val = rs2_val;  // Source value (for SC, SWAP, ADD, etc.)
+                EX_MEM_reg_write = true;     // Most atomics write back to Rd
+            } else {
+                EX_MEM_is_trap = true; // Illegal width
+            }
+        } else {
+            EX_MEM_is_trap = true; // Extension disabled
+        }
+        break;
+    }
     case 0x33: { // R-type
             ap_uint<5> shamt = rs2_val.range(4,0);
             EX_MEM_reg_write = true;
@@ -223,6 +277,85 @@ ap_int<32> execute() {
                         case 0x0: EX_MEM_alu_result = rs1_val - rs2_val; break; // SUB
                         case 0x5: EX_MEM_alu_result = rs1_val >> shamt; break; // SRA
                         default:  EX_MEM_reg_write = false; EX_MEM_is_trap = true; break;
+                    }
+                    break;
+                case 0x01: // M-Extension (MUL, DIV, REM)
+                    if (ENABLE_M_EXTENSION) {
+                        // This logic is ONLY synthesized if flag is TRUE.
+                        // ---------------------------------------------------------
+                        // OPTIMIZATION: Manually share ONE divider for all ops.
+                        // This prevents HLS from building 4 separate divider units.
+                        // ---------------------------------------------------------
+                        // 1. Identify Operation Properties
+                        bool is_div  = (ID_EX_funct3 == 0x4); // DIV
+                        bool is_divu = (ID_EX_funct3 == 0x5); // DIVU
+                        bool is_rem  = (ID_EX_funct3 == 0x6); // REM
+                        bool is_remu = (ID_EX_funct3 == 0x7); // REMU
+                        
+                        bool is_div_op = is_div || is_divu || is_rem || is_remu;
+                        bool is_signed = is_div || is_rem;
+
+                        // 2. Prepare Operands (Convert Signed to Unsigned Absolute)
+                        bool sign_a = rs1_val[31];
+                        bool sign_b = rs2_val[31];
+                        
+                        ap_uint<32> u_a = (is_signed && sign_a) ? (ap_uint<32>)(-rs1_val) : (ap_uint<32>)rs1_val;
+                        ap_uint<32> u_b = (is_signed && sign_b) ? (ap_uint<32>)(-rs2_val) : (ap_uint<32>)rs2_val;
+
+                        // 3. The Heavy Math (Instantiates ONLY ONE Divider)
+                        ap_uint<32> u_quot = 0;
+                        ap_uint<32> u_rem  = 0;
+
+                        // Only run the divider if it's a division op (saves power/logic on MULs)
+                        if (is_div_op) {
+                            if (u_b != 0) {
+                                u_quot = u_a / u_b;
+                                // OPTIMIZATION: Calculate Remainder using Multiplier (uses DSPs)
+                                // instead of a second Divider core (uses ~2000 FFs).
+                                // Formula: Rem = A - (Quotient * B)
+                                u_rem = u_a - (u_quot * u_b);
+                            } else {
+                                // RISC-V Spec for Div by Zero
+                                u_quot = -1;  // All 1s
+                                u_rem  = u_a; // Remainder is dividend
+                            }
+                        }
+
+                        // 4. Fix Signs for Results
+                        ap_int<32> res_div = 0;
+                        ap_int<32> res_rem = 0;
+
+                        if (is_signed) {
+                            // Quotient is negative if signs differ
+                            res_div = ((sign_a ^ sign_b) && u_b != 0) ? (ap_int<32>)-u_quot : (ap_int<32>)u_quot;
+                            // Remainder sign follows the Dividend (rs1)
+                            res_rem = (sign_a && u_b != 0) ? (ap_int<32>)-u_rem : (ap_int<32>)u_rem;
+                            
+                            // Handle Overflow Case (-MAX / -1)
+                            if (u_b == 1 && sign_b && !sign_a && rs1_val == (ap_int<32>)0x80000000) {
+                                res_div = rs1_val;
+                                res_rem = 0;
+                            }
+                        } else {
+                            res_div = (ap_int<32>)u_quot;
+                            res_rem = (ap_int<32>)u_rem;
+                        }
+
+                        // 5. Select Output
+                        switch ((unsigned)ID_EX_funct3) {
+                            case 0x0: EX_MEM_alu_result = rs1_val * rs2_val; break; // MUL
+                            case 0x1: EX_MEM_alu_result = (ap_int<32>)(((ap_int<64>)rs1_val * (ap_int<64>)rs2_val) >> 32); break; // MULH
+                            case 0x2: EX_MEM_alu_result = (ap_int<32>)(((ap_int<64>)rs1_val * (ap_uint<64>)((ap_uint<32>)rs2_val)) >> 32); break; // MULHSU
+                            case 0x3: EX_MEM_alu_result = (ap_int<32>)(((ap_uint<64>)((ap_uint<32>)rs1_val) * (ap_uint<64>)((ap_uint<32>)rs2_val)) >> 32); break; // MULHU
+                            case 0x4: EX_MEM_alu_result = res_div; break; // DIV
+                            case 0x5: EX_MEM_alu_result = res_div; break; // DIVU
+                            case 0x6: EX_MEM_alu_result = res_rem; break; // REM
+                            case 0x7: EX_MEM_alu_result = res_rem; break; // REMU
+                        }
+                    } else {
+                        // If disabled, this path becomes an Illegal Instruction Trap.
+                        EX_MEM_reg_write = false; 
+                        EX_MEM_is_trap = true; 
                     }
                     break;
                 default:
@@ -319,9 +452,10 @@ ap_int<32> execute() {
         
         ap_uint<32> csr_read_val = 0;
         
-        // CSR Read Switch
+        // CSR Read Switch (MODIFIED FOR TASK 2 & 3)
         switch (csr_addr) {
             case 0x305: csr_read_val = csr_mtvec; break;
+            case 0x340: csr_read_val = csr_mscratch; break; // mscratch
             case 0x341: csr_read_val = csr_mepc; break;
             case 0x342: csr_read_val = csr_mcause; break;
             case 0xB00: csr_read_val = csr_mcycle; break;   // mcycle
@@ -330,6 +464,8 @@ ap_int<32> execute() {
             case 0xC02: csr_read_val = csr_minstret; break; // instret (user alias)
             case 0xF14: csr_read_val = 0; break;            // mhartid (Core 0)
             case 0x300: csr_read_val = csr_mstatus; break;  // mstatus
+            case 0x304: csr_read_val = csr_mie; break;      // mie (IRQ Enable)
+            case 0x344: csr_read_val = csr_mip; break;      // mip (IRQ Pending)
             default:    csr_read_val = 0; break;
         }
         
@@ -337,17 +473,46 @@ ap_int<32> execute() {
 
         switch ((unsigned)ID_EX_funct3) {
             case 0x0: // ECALL / EBREAK
-                if (ID_EX_imm == 0x000) { EX_MEM_is_trap = true; trap_cause = 11; } // ECALL
+                if (ID_EX_imm == 0x000) { 
+                    // Check for Exit System Call
+                    if (regfile[17] == 93) {
+                        is_finished = true;
+                        std::cout << "[CORE DEBUG] Exit Condition Met! Stopping Simulation." << std::endl;
+                    }
+                    EX_MEM_is_trap = true; 
+                    trap_cause = 11; 
+                } // ECALL
                 else if (ID_EX_imm == 0x001) { EX_MEM_is_trap = true; trap_cause = 3; } // EBREAK
+                else if (ID_EX_imm == 0x302) { // MRET
+                    // 1. Restore PC from MEPC
+                    next_pc = (ap_uint<32>)csr_mepc;
+                    took_branch_or_jump = true;
+
+                    // 2. Manage Interrupt Enable Bits in mstatus
+                    bool mpie = (csr_mstatus >> 7) & 1; // Extract previous interrupt state
+                    
+                    if(mpie) csr_mstatus |= (1 << 3);   // Restore MIE to 1
+                    else     csr_mstatus &= ~(1 << 3);  // Restore MIE to 0
+                    
+                    csr_mstatus |= (1 << 7);            // Set MPIE to 1 (standard requirement)
+
+                    // 3. Prevent writing to destination register
+                    EX_MEM_reg_write = false; 
+                    
+                    if(CORE_DEBUG) std::cout << "[MRET] Returning to 0x" << std::hex << (int)next_pc << std::dec << "\n";
+                }
                 break;
             case 0x1: // CSRRW
                 EX_MEM_alu_result = csr_read_val; 
                 EX_MEM_reg_write = (ID_EX_rd != 0);
                 switch (csr_addr) {
                     case 0x305: csr_mtvec = rs1_val; break;
+                    case 0x340: csr_mscratch = rs1_val; break; // mscratch
                     case 0x341: csr_mepc  = rs1_val; break;
                     case 0x342: csr_mcause = rs1_val; break;
                     case 0x300: csr_mstatus = rs1_val; break;
+                    case 0x304: csr_mie = rs1_val; break;      // mie
+                    case 0x344: csr_mip = rs1_val; break;      // mip
                 }
                 break;
             case 0x2: // CSRRS
@@ -357,9 +522,12 @@ ap_int<32> execute() {
                     ap_uint<32> new_val = csr_read_val | rs1_val; 
                     switch (csr_addr) {
                         case 0x305: csr_mtvec = new_val; break;
+                        case 0x340: csr_mscratch = new_val; break; // mscratch
                         case 0x341: csr_mepc  = new_val; break;
                         case 0x342: csr_mcause = new_val; break;
                         case 0x300: csr_mstatus = new_val; break;
+                        case 0x304: csr_mie = new_val; break;      // mie
+                        case 0x344: csr_mip = new_val; break;      // mip
                     }
                 }
                 break;
@@ -370,9 +538,12 @@ ap_int<32> execute() {
                     ap_uint<32> new_val = csr_read_val & ~rs1_val;
                     switch (csr_addr) {
                         case 0x305: csr_mtvec = new_val; break;
+                        case 0x340: csr_mscratch = new_val; break; // mscratch
                         case 0x341: csr_mepc = new_val; break;
                         case 0x342: csr_mcause = new_val; break;
                         case 0x300: csr_mstatus = new_val; break;
+                        case 0x304: csr_mie = new_val; break;      // mie
+                        case 0x344: csr_mip = new_val; break;      // mip
                     }
                 }
                 break;
@@ -381,9 +552,12 @@ ap_int<32> execute() {
                 EX_MEM_reg_write = (ID_EX_rd != 0);
                 switch (csr_addr) {
                     case 0x305: csr_mtvec = (ap_uint<32>)rs1_imm; break;
+                    case 0x340: csr_mscratch = (ap_uint<32>)rs1_imm; break; // mscratch
                     case 0x341: csr_mepc  = (ap_uint<32>)rs1_imm; break;
                     case 0x342: csr_mcause = (ap_uint<32>)rs1_imm; break;
                     case 0x300: csr_mstatus = (ap_uint<32>)rs1_imm; break;
+                    case 0x304: csr_mie = (ap_uint<32>)rs1_imm; break;      // mie
+                    case 0x344: csr_mip = (ap_uint<32>)rs1_imm; break;      // mip
                 }
                 break;
             case 0x6: // CSRRSI
@@ -393,9 +567,12 @@ ap_int<32> execute() {
                     ap_uint<32> new_val = csr_read_val | rs1_imm; 
                     switch (csr_addr) {
                         case 0x305: csr_mtvec = new_val; break;
+                        case 0x340: csr_mscratch = new_val; break; // mscratch
                         case 0x341: csr_mepc  = new_val; break;
                         case 0x342: csr_mcause = new_val; break;
                         case 0x300: csr_mstatus = new_val; break;
+                        case 0x304: csr_mie = new_val; break;      // mie
+                        case 0x344: csr_mip = new_val; break;      // mip
                     }
                 }
                 break;
@@ -406,9 +583,12 @@ ap_int<32> execute() {
                     ap_uint<32> new_val = csr_read_val & ~rs1_imm; 
                     switch (csr_addr) {
                         case 0x305: csr_mtvec = new_val; break;
+                        case 0x340: csr_mscratch = new_val; break; // mscratch
                         case 0x341: csr_mepc  = new_val; break;
                         case 0x342: csr_mcause = new_val; break;
                         case 0x300: csr_mstatus = new_val; break;
+                        case 0x304: csr_mie = new_val; break;      // mie
+                        case 0x344: csr_mip = new_val; break;      // mip
                     }
                 }
                 break;
@@ -459,7 +639,7 @@ ap_int<32> execute() {
 
 // Returns the value that would be written to register (or loaded val)
 ap_int<32> memory(volatile uint32_t* ram) {
-    #pragma HLS INLINE off
+    #pragma HLS INLINE
     MEM_WB_is_trap = EX_MEM_is_trap; 
     if (EX_MEM_is_trap) {
         EX_MEM_mem_read = false;
@@ -476,7 +656,102 @@ ap_int<32> memory(volatile uint32_t* ram) {
     unsigned d_idx = (phys_ea - (DRAM_BASE & 0x000FFFFF)) >> 2;
     unsigned byte_off = phys_ea & 0x3;
 
-    if (EX_MEM_mem_read) {
+    // =============================================================
+    // ATOMIC MEMORY OPERATIONS (A-EXTENSION)
+    // =============================================================
+    if (EX_MEM_is_atomic) {
+        if (d_idx >= RAM_SIZE) {
+            MEM_WB_value = 0; // Fault
+        } else {
+            uint32_t loaded_raw = ram[d_idx]; // Read Current Memory
+            ap_int<32> loaded_val = (ap_int<32>)loaded_raw;
+            ap_int<32> write_val = 0;
+            bool do_write = false;
+
+            // Load Reserved (LR.W)
+            if (EX_MEM_atomic_op == 0x02) { 
+                lr_addr = ea_u;
+                lr_valid = true;
+                MEM_WB_value = loaded_val; // Result is the loaded value
+                do_write = false; // LR does not write to RAM
+                if(CORE_DEBUG) std::cout << "[AMO] LR at 0x" << std::hex << ea_u << std::dec << "\n";
+            } 
+            // Store Conditional (SC.W)
+            else if (EX_MEM_atomic_op == 0x03) {
+                if (lr_valid && lr_addr == ea_u) {
+                    write_val = EX_MEM_store_val;
+                    do_write = true;
+                    MEM_WB_value = 0; // Success (0)
+                    lr_valid = false; // Invalidate
+                } else {
+                    do_write = false;
+                    MEM_WB_value = 1; // Failure (1)
+                }
+                if(CORE_DEBUG) std::cout << "[AMO] SC at 0x" << std::hex << ea_u << (do_write ? " Success" : " Fail") << std::dec << "\n";
+            }
+            // AMO Read-Modify-Write Operations
+            else {
+                ap_int<32> op_b = EX_MEM_store_val;
+                do_write = true;
+                switch (EX_MEM_atomic_op) {
+                    case 0x01: write_val = op_b; break; // AMOSWAP
+                    case 0x00: write_val = loaded_val + op_b; break; // AMOADD
+                    case 0x04: write_val = loaded_val ^ op_b; break; // AMOXOR
+                    case 0x0C: write_val = loaded_val & op_b; break; // AMOAND
+                    case 0x08: write_val = loaded_val | op_b; break; // AMOOR
+                    case 0x10: write_val = (loaded_val < op_b) ? loaded_val : op_b; break; // AMOMIN
+                    case 0x14: write_val = (loaded_val > op_b) ? loaded_val : op_b; break; // AMOMAX
+                    case 0x18: write_val = ((ap_uint<32>)loaded_val < (ap_uint<32>)op_b) ? loaded_val : op_b; break; // AMOMINU
+                    case 0x1C: write_val = ((ap_uint<32>)loaded_val > (ap_uint<32>)op_b) ? loaded_val : op_b; break; // AMOMAXU
+                    default: do_write = false; break;
+                }
+                MEM_WB_value = loaded_val; // AMOs write original value to Rd
+            }
+
+            if (do_write) {
+                ram[d_idx] = (uint32_t)write_val;
+                // Invalidate reservation on any write
+                lr_valid = false; 
+            }
+        }
+    }
+    // =============================================================
+    // NORMAL LOAD
+    // =============================================================
+    else if (EX_MEM_mem_read) {
+        // ----------------------------------------------------------------
+        // MMIO READ: CLINT (Timer)
+        // ----------------------------------------------------------------
+        // mtimecmp (0x2004000) - Timer Compare Register
+        if (phys_ea == 0x2004000) {
+            MEM_WB_value = (ap_int<32>)(mtimecmp & 0xFFFFFFFF); // Low 32 bits
+            MEM_WB_reg_write = true;
+            return MEM_WB_value;
+        }
+        if (phys_ea == 0x2004004) {
+            MEM_WB_value = (ap_int<32>)(mtimecmp >> 32); // High 32 bits
+            MEM_WB_reg_write = true;
+            return MEM_WB_value;
+        }
+        
+        // mtime (0x200BFF8) - Current Time (Aliased to csr_mcycle)
+        // Linux reads this to know "what time is it?"
+        if (phys_ea == 0x200BFF8) {
+            MEM_WB_value = (ap_int<32>)(csr_mcycle & 0xFFFFFFFF); // Low 32 bits
+            MEM_WB_reg_write = true;
+            return MEM_WB_value;
+        }
+        if (phys_ea == 0x200BFFC) {
+            // Since csr_mcycle is 32-bit in this core, high bits are 0.
+            // Ideally, csr_mcycle should be 64-bit for long uptimes.
+            MEM_WB_value = 0; 
+            MEM_WB_reg_write = true;
+            return MEM_WB_value;
+        }
+
+        // ----------------------------------------------------------------
+        // STANDARD RAM READ
+        // ----------------------------------------------------------------
         if (d_idx >= RAM_SIZE) {
             if(CORE_DEBUG) std::cerr << "[MEM] Load OOB: EA=0x" << std::hex << ea_u << "\n";
             MEM_WB_value = 0;
@@ -503,7 +778,39 @@ ap_int<32> memory(volatile uint32_t* ram) {
             MEM_WB_value = loaded_val; 
         }
     }
+    // =============================================================
+    // NORMAL STORE
+    // =============================================================
     else if (EX_MEM_mem_write) {
+        // Any standard write invalidates a Load Reservation
+        lr_valid = false;
+
+        // ----------------------------------------------------------------
+        // MMIO: UART (0x10000000) (TASK 4 ADDITION)
+        // ----------------------------------------------------------------
+        if (phys_ea == 0x10000000) { 
+            char c = (char)(EX_MEM_store_val & 0xFF);
+            std::cout << c << std::flush; // Print directly to HLS simulation terminal
+            // Do NOT write to RAM
+            return MEM_WB_value; 
+        }
+
+        // ----------------------------------------------------------------
+        // MMIO: CLINT (Timer Compare) (TASK 4 ADDITION)
+        // ----------------------------------------------------------------
+        // Lower 32-bits of mtimecmp
+        if (phys_ea == 0x2004000) {
+            mtimecmp = (mtimecmp & 0xFFFFFFFF00000000) | (ap_uint<32>)EX_MEM_store_val;
+            if(CORE_DEBUG) std::cout << "[CLINT] mtimecmp Low Update: " << std::hex << mtimecmp << std::dec << "\n";
+            return MEM_WB_value;
+        }
+        // Upper 32-bits of mtimecmp
+        if (phys_ea == 0x2004004) {
+             mtimecmp = (mtimecmp & 0x00000000FFFFFFFF) | ((ap_uint<64>)EX_MEM_store_val << 32);
+             if(CORE_DEBUG) std::cout << "[CLINT] mtimecmp High Update: " << std::hex << mtimecmp << std::dec << "\n";
+             return MEM_WB_value;
+        }
+
         if (d_idx >= RAM_SIZE) {
             if(CORE_DEBUG) std::cerr << "[MEM] Store OOB: EA=0x" << std::hex << ea_u << "\n";
         } else {
@@ -546,6 +853,17 @@ ap_int<32> memory(volatile uint32_t* ram) {
                 ram[d_idx + 1] = (uint32_t)word1; 
             }
             
+            // ----------------------------------------------------------------
+            // HTIF INTERCEPTOR (Prevents Syscall Deadlock)
+            // ----------------------------------------------------------------
+            if (phys_ea == 0x1000) {
+                unsigned fromhost_idx = d_idx + 16; 
+                if (fromhost_idx < RAM_SIZE) {
+                    ram[fromhost_idx] = 1; 
+                }
+            }
+            // ----------------------------------------------------------------
+            
             if(CORE_DEBUG) std::cout << "[MEM] Stored 0x" << std::hex << (int)EX_MEM_store_val << " to 0x" << ea_u << std::dec << "\n";
         }
     }
@@ -554,7 +872,7 @@ ap_int<32> memory(volatile uint32_t* ram) {
 
 // Returns the value written to register (for debug/pipeline tracking)
 ap_int<32> writeback() {
-    #pragma HLS INLINE off
+    #pragma HLS INLINE
     ap_int<32> wb_val = 0;
     if (MEM_WB_reg_write && MEM_WB_rd != 0 && !MEM_WB_is_trap) {
         regfile[MEM_WB_rd] = MEM_WB_value;
@@ -568,20 +886,59 @@ ap_int<32> writeback() {
 // ------------------------------------------------------------
 // Modified Step function within a loop (Unified Memory)
 // ------------------------------------------------------------
-void riscv_step(volatile uint32_t* ram, int cycles) {
+void riscv_step(volatile uint32_t* ram, int* cycles_output) {
     // AXI Master Interface for RAM
     #pragma HLS INTERFACE m_axi port=ram offset=off depth=262144 bundle=gmem
     // Cycle Counter
-    #pragma HLS INTERFACE s_axilite port=cycles
+    #pragma HLS INTERFACE s_axilite port=cycles_output bundle=control
     // AXI Lite Interface for Control
-    #pragma HLS INTERFACE s_axilite port=return
+    #pragma HLS INTERFACE s_axilite port=return bundle=control
+    #pragma HLS BIND_STORAGE variable=regfile type=ram_2p impl=lutram
 
-    INSTRUCTION_LOOP: for (int i = 0; i < cycles; i++) {
+    // Reset the finished flag at start of simulation
+    is_finished = false;
+
+    INSTRUCTION_LOOP: while(true) {
         #pragma HLS LOOP_TRIPCOUNT min=50 max=500000
 
         // ------------------ Steps for CSR ------------------
         csr_mcycle++;   // Always increment cycles
         csr_minstret++;
+
+        // ------------------ INTERRUPT LOGIC (TASK 3 ADDITION) ------------------
+        // 1. Check Timer Match (Casting mcycle to 64-bit for comparison)
+        bool timer_irq = ((ap_uint<64>)csr_mcycle >= mtimecmp);
+
+        // 2. Check Enables
+        bool global_ie = (csr_mstatus >> 3) & 1; // MIE bit (3)
+        bool timer_ie  = (csr_mie >> 7) & 1;     // MTIE bit (7)
+
+        // 3. Update Pending Register (MIP)
+        if (timer_irq) csr_mip |= (1 << 7); // Set MTIP (bit 7)
+        else           csr_mip &= ~(1 << 7);
+
+        // 4. Take Trap if conditions met
+        if (timer_irq && global_ie && timer_ie) {
+            if (CORE_DEBUG) std::cout << "[INT] Timer Interrupt! Jumping to Handler.\n";
+            
+            csr_mcause = 0x80000007; // Machine Timer Interrupt (Async + 7)
+            csr_mepc   = pc;         // Save current PC
+            
+            // Disable Global Interrupts
+            // Save MIE to MPIE (bit 7)
+            bool old_mie = (csr_mstatus >> 3) & 1;
+            if (old_mie) csr_mstatus |= (1 << 7);
+            else         csr_mstatus &= ~(1 << 7);
+            
+            csr_mstatus &= ~(1 << 3); // Clear MIE
+            
+            // Jump to Handler (Using mtvec base address)
+            pc = csr_mtvec; 
+            
+            // SKIP FETCH - Execute Handler immediately
+            continue; 
+        }
+        // -----------------------------------------------------------------------
 
         // ------------------ Call Stages ------------------
         // We capture returns to prevent HLS optimization from pruning "unused" logic,
@@ -601,6 +958,12 @@ void riscv_step(volatile uint32_t* ram, int cycles) {
             took_branch_or_jump = false;  
         } else {
             pc += 4;
+        }
+
+        // Break loop if ecall exit detected
+        if (is_finished) {
+            *cycles_output = csr_mcycle;
+            return;
         }
     }
 }

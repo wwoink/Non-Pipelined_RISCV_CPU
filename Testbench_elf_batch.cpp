@@ -27,12 +27,7 @@
 //    Increased to accommodate larger benchmarks if needed
 #define TEST_TIMEOUT   5000000 
 
-// 2. NEW: Batch Size
-//    How many cycles the hardware runs per call. 
-//    Higher = Faster simulation, Less "Heartbeat" updates. Longer time between knowing if the program is complete
-#define BATCH_SIZE     5000    
-
-// 3. Debug Switch
+// 2. Debug Switch
 const bool ENABLE_CORE_DEBUG = false;
 
 // ============================================================================
@@ -117,52 +112,22 @@ int main(int argc, char* argv[])
         riscv_init();
 
         // 5. Run Simulation
-        bool finished = false;
-        
-        // --- UPDATED LOOP: Steps by BATCH_SIZE ---
-        for (int i = 0; i < TEST_TIMEOUT; i += BATCH_SIZE) {
+        // Single Call to Hardware per test file (matching Hardcoded logic)
+        riscv_step((volatile uint32_t*)ram, TEST_TIMEOUT);
             
-            // RUN BATCH: Hardware runs 5000 cycles internally
-            riscv_step((volatile uint32_t*)ram, BATCH_SIZE);
+        // 6. Check Host Interface after simulation
+        uint32_t tohost = ram[tohost_idx];
             
-            // Check Host Interface
-            uint32_t tohost = ram[tohost_idx];
-            
-            if (tohost != 0) {
-                // ACK the write by clearing memory (Important for benchmarks)
-                ram[tohost_idx] = 0;
-
-                // If this is NOT an exit command (LSB is 0), it's a syscall/print.
-                // We must write 1 to 'fromhost' (offset 0x40 from tohost) to signal completion.
-                // 0x40 bytes = 16 words.
-                if ((tohost & 1) == 0) {
-                    unsigned fromhost_idx = tohost_idx + 16; // 0x40 / 4 = 16
-                    if (fromhost_idx < RAM_SIZE) {
-                        ram[fromhost_idx] = 1; 
-                    }
-                }
-
-                // Logic: LSB 1 = Exit, LSB 0 = Syscall
-                if (tohost & 1) {
-                    int exit_code = tohost >> 1;
-                    if (exit_code == 0) {
-                        std::cout << std::left << std::setw(30) << test_name << " : PASS\n";
-                        total_pass++;
-                    } else {
-                        std::cout << std::left << std::setw(30) << test_name << " : FAIL (Code: " << exit_code << ")\n";
-                        total_fail++;
-                    }
-                    finished = true;
-                    break;
-                } else {
-                    // It's a Syscall (e.g., printf char). 
-                    // In this batch runner, we ignore output to keep the console clean.
-                    // But clearing the memory above ensures the core doesn't hang waiting for ACK.
-                }
+        if (tohost & 1) {
+            int exit_code = tohost >> 1;
+            if (exit_code == 0) {
+                std::cout << std::left << std::setw(30) << test_name << " : PASS\n";
+                total_pass++;
+            } else {
+                std::cout << std::left << std::setw(30) << test_name << " : FAIL (Code: " << exit_code << ")\n";
+                total_fail++;
             }
-        }
-
-        if (!finished) {
+        } else {
             std::cout << std::left << std::setw(30) << test_name << " : TIMEOUT\n";
             total_fail++;
         }

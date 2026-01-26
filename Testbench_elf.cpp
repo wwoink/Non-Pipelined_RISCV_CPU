@@ -23,10 +23,7 @@
 // 1. Execution Limit
 #define INSTRUCTION_LIMIT 1000000 
 
-// 2. NEW: Batch Size
-#define BATCH_SIZE 5000
-
-// 3. Debug Switches
+// 2. Debug Switches
 const bool ENABLE_CORE_DEBUG = false;
 const bool ENABLE_MEMORY_INSPECTION = false; 
 
@@ -69,50 +66,31 @@ int main(int argc, char* argv[])
     
     riscv_init();
 
-    std::cout << "\n[TESTBENCH] Starting Batch Simulation (" << BATCH_SIZE << " cycles/step)...\n";
+    std::cout << "\n[TESTBENCH] Starting Simulation (Max " << INSTRUCTION_LIMIT << " cycles)...\n";
     
     bool passed = false;
-    bool done = false;
 
-    // UPDATED LOOP: Increment by BATCH_SIZE
-    for (int i = 0; i < INSTRUCTION_LIMIT; i += BATCH_SIZE) {
-        
-        // Debug logic adjusted for batching (turn on near end)
-        if (i >= INSTRUCTION_LIMIT - 10000) {
-            // CORE_DEBUG = true; 
+    // Single Call to Hardware
+    // The hardware will loop internally until it hits the ecall or the limit
+    riscv_step((volatile uint32_t*)ram, INSTRUCTION_LIMIT);
+
+    // Check results after hardware returns
+    uint32_t tohost = ram[tohost_idx];
+
+    if (tohost & 1) { 
+        int exit_code = tohost >> 1;
+        if (exit_code == 0) {
+            std::cout << "[TESTBENCH] PASS (Hardware exited via ecall)\n";
+            passed = true;
+        } else {
+            std::cout << "[TESTBENCH] FAIL (Code: " << exit_code << ")\n";
+            passed = false;
         }
-
-        // RUN BATCH
-        riscv_step((volatile uint32_t*)ram, BATCH_SIZE);
-
-        uint32_t tohost = ram[tohost_idx];
-
-        if (tohost != 0) {
-            ram[tohost_idx] = 0; // ACK writes
-
-            if ((tohost & 1) == 0) {
-                unsigned fromhost_idx = tohost_idx + 16; 
-                if (fromhost_idx < RAM_SIZE) {
-                    ram[fromhost_idx] = 1; 
-                }
-            }
-            
-            // Check LSB for Exit Code
-            if (tohost & 1) { 
-                int exit_code = tohost >> 1;
-                if (exit_code == 0) {
-                    std::cout << "[TESTBENCH] PASS at approx cycle " << i << "\n";
-                    passed = true;
-                } else {
-                    std::cout << "[TESTBENCH] FAIL (Code: " << exit_code << ") at approx cycle " << i << "\n";
-                }
-                done = true;
-                break;
-            }
-        }
+    } else {
+        // If tohost is 0, it means we hit the cycle limit without finishing
+        std::cout << "[TESTBENCH] TIMEOUT (Reached " << INSTRUCTION_LIMIT << " cycles without ecall)\n";
+        passed = false;
     }
-
-    if (!done) std::cout << "[TESTBENCH] TIMEOUT\n";
 
     // ================================================================
     // MEMORY INSPECTION (Using Configuration Switch)
@@ -142,5 +120,5 @@ int main(int argc, char* argv[])
         }
     }
 
-    return 0;
+    return passed ? 0 : 1;
 }

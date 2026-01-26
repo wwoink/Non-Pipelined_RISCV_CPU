@@ -21,16 +21,10 @@
 // ============================================================================
 
 // 1. Hardcoded Path
-#define ELF_PATH "I:/Vitis_Files/Pipeline_Tests/Global_Core_Revised/Benchmarks/rv32ui-p-benchmarks/rsort.riscv"
+#define ELF_PATH "I:/Vitis_Files/Pipeline_Tests/Global_Core_Revised/Benchmarks/rv32ui-p-benchmarks/m-ext/multiply.riscv"
 
-// 2. Execution Limit (Total Cycles)
-#define INSTRUCTION_LIMIT 500000 
-
-// 3. Batch Size (New: How many cycles to run per hardware call)
-#define BATCH_SIZE 5000
-
-// 4. Debug Switches
-const bool ENABLE_CORE_DEBUG = false;
+// 2. Debug Switches
+const bool ENABLE_CORE_DEBUG = true;
 const bool ENABLE_MEMORY_INSPECTION = false; 
 
 // ============================================================================
@@ -40,7 +34,7 @@ ap_uint<32> ram[RAM_SIZE];
 
 extern void riscv_init();
 // UPDATED SIGNATURE: Now accepts the cycle count
-extern void riscv_step(volatile uint32_t* ram, int cycles);
+extern void riscv_step(volatile uint32_t* ram, int* cycles_output);
 
 int main(int argc, char* argv[])
 {
@@ -77,50 +71,36 @@ int main(int argc, char* argv[])
     
     riscv_init();
 
-    std::cout << "\n[TESTBENCH] Starting Batch Simulation (" << BATCH_SIZE << " cycles/step)...\n";
+    std::cout << "\n[TESTBENCH] Starting Simulation...\n";
     
     bool passed = false;
-    bool done = false;
 
-    // UPDATED LOOP: Steps by BATCH_SIZE
-    for (int i = 0; i < INSTRUCTION_LIMIT; i += BATCH_SIZE) {
-        
-        // --- RUN BATCH ---
-        // This runs 5000 cycles in hardware before returning
-        riscv_step((volatile uint32_t*)ram, BATCH_SIZE);
+    int final_cycle_count = 0;
 
-        uint32_t tohost = ram[tohost_idx];
+    // Single Call to Hardware
+    // The hardware will loop internally until it hits the ecall
+    riscv_step((volatile uint32_t*)ram, &final_cycle_count);
 
-        if (tohost != 0) {
-            ram[tohost_idx] = 0; // ACK writes
+    // [MODIFIED] Print the Result
+    std::cout << "--------------------------------------------------\n";
+    std::cout << "[TESTBENCH] Hardware Finished.\n";
+    std::cout << "[TESTBENCH] Total Cycles Executed: " << final_cycle_count << "\n";
+    std::cout << "--------------------------------------------------\n";
 
-            // Handle Syscalls (LSB 0)
-            if ((tohost & 1) == 0) {
-                unsigned fromhost_idx = tohost_idx + 16;
-                if (fromhost_idx < RAM_SIZE) {
-                    ram[fromhost_idx] = 1; 
-                }
-            }
-            
-            // Handle Exit (LSB 1)
-            if (tohost & 1) { 
-                int exit_code = tohost >> 1;
-                if (exit_code == 0) {
-                    // Note: 'i' is the start of the batch, so we say "approx"
-                    std::cout << "[TESTBENCH] PASS at approx cycle " << i << "\n";
-                    passed = true;
-                } else {
-                    std::cout << "[TESTBENCH] FAIL (Code: " << exit_code << ") at approx cycle " << i << "\n";
-                    passed = false;
-                }
-                done = true;
-                break;
-            }
+    // [MODIFIED] Check results after hardware returns
+    uint32_t tohost = ram[tohost_idx];
+
+    if (tohost & 1) { 
+        int exit_code = tohost >> 1;
+        if (exit_code == 0) {
+            std::cout << "[TESTBENCH] PASS (Hardware exited via ecall)\n";
+            passed = true;
+        } else {
+            std::cout << "[TESTBENCH] FAIL (Code: " << exit_code << ")\n";
+            passed = false;
         }
-    }
-
-    if (!done) {
-        std::cout << "[TESTBENCH] TIMEOUT (Reached " << INSTRUCTION_LIMIT << " cycles)\n";
+    } else {
+        std::cout << "[TESTBENCH] ERROR (Hardware returned, but tohost is 0 - Unknown Error)\n";
         passed = false;
     }
 

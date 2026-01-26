@@ -23,10 +23,12 @@ extern bool CORE_DEBUG;
 // =======================================================
 // Core Interface
 // =======================================================
+
+// Initialization function
 void riscv_init();
 
 // Unified Memory Step Function
-// Now accepts a volatile pointer to memory (AXI Master)
-void riscv_step(volatile uint32_t* ram, int cycles);
+// [UPDATED] 'cycles_output' is now a pointer so the core can write back the final count.
+void riscv_step(volatile uint32_t* ram, int* cycles_output);
 
 #endif // CORE_H
