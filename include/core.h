@@ -7,17 +7,17 @@
 // =======================================================
 // Global memory configuration
 // =======================================================
-// 262144 words = 1MB total memory size
-#define RAM_SIZE 262144 
+#define RAM_SIZE 33554432 
 
 // RISC-V Default Memory Map
 #define DRAM_BASE 0x80000000
-#define DMEM_STACK_TOP 0x80040000 // Top of the 256KB Stack area
+#define DMEM_STACK_TOP 0x87FFFFFF
 
 // =======================================================
 // Global ELF / memory configuration variables
 // =======================================================
 extern ap_uint<32> ENTRY_PC;
+extern ap_uint<32> DTB_ADDR;
 extern bool CORE_DEBUG;
 
 // =======================================================

@@ -2,6 +2,7 @@
 #include <iostream>
 #include <cstring>
 #include "core.h" 
+#include <cstdio>
 
 // ------------------------------------------------------------
 // Global Debug Switch
@@ -18,7 +19,13 @@ const bool ENABLE_A_EXTENSION = true; // Toggle for Atomics
 // ------------------------------------------------------------
 // Global Architectural State
 // ------------------------------------------------------------
-ap_uint<32> pc = 0;
+#ifdef __SYNTHESIS__
+    // This value is baked into the FPGA bitstream as the Power-On default
+    ap_uint<32> pc = 0x80000000; 
+#else
+    // This value is used during C Simulation (and later overwritten by riscv_init)
+    ap_uint<32> pc = 0;          
+#endif
 ap_int<32>  regfile[32];
 bool is_finished = false;
 
@@ -76,7 +83,7 @@ ap_uint<32> csr_mcycle = 0;   // Cycle Counter (0xB00)
 ap_uint<32> csr_minstret = 0; // Instructions Retired (0xB02)
 ap_uint<32> csr_mstatus = 0;  // Status Register (0x300)
 
-// --- Interrupts & Timer (TASK 3 ADDITION) ---
+// --- Interrupts & Timer ---
 ap_uint<32> csr_mie = 0; // Interrupt Enable Register (0x304)
 ap_uint<32> csr_mip = 0; // Interrupt Pending Register (0x344)
 // The CLINT (Core Local Interruptor) requires a 64-bit timer comparison
@@ -84,6 +91,7 @@ ap_uint<64> mtimecmp = 0xFFFFFFFFFFFFFFFF;
 
 // --- Global Variable Master Definitions ---
 ap_uint<32> ENTRY_PC;
+ap_uint<32> DTB_ADDR;
 
 // ------------------------------------------------------------
 // Initialization Function
@@ -95,6 +103,10 @@ void riscv_init() {
     regfile[1] = (ap_int<32>)0xDEADBEEF;       
     regfile[0] = 0;                           
     regfile[2] = (ap_int<32>) (unsigned)DMEM_STACK_TOP;
+
+    //Linux setup
+    regfile[10] = 0;         // a0 = Hart ID (0)
+    regfile[11] = 0x80800000; // a1 = Device Tree Address
     
     if(CORE_DEBUG) {
         std::cout << "[INIT] Core Reset. PC=0x" << std::hex << (unsigned)pc 
@@ -167,11 +179,11 @@ ap_int<32> sextJ(ap_uint<32> insn) {
 // Returns the fetched instruction
 ap_uint<32> fetch(volatile uint32_t* ram) {
     #pragma HLS INLINE
-    uint32_t phys_pc = pc & 0x000FFFFF; 
-    uint32_t im_idx = (phys_pc - (DRAM_BASE & 0x000FFFFF)) >> 2;
+    uint32_t phys_pc = pc & 0x07FFFFFF; 
+    uint32_t im_idx = (phys_pc - (DRAM_BASE & 0x07FFFFFF)) >> 2;
     
     if (im_idx < RAM_SIZE) {
-        uint32_t raw_instr = ram[im_idx];
+        uint32_t raw_instr = ram[im_idx];   
         IF_ID_instr = (ap_uint<32>)raw_instr;
     } else {
         IF_ID_instr = 0; 
@@ -452,7 +464,7 @@ ap_int<32> execute() {
         
         ap_uint<32> csr_read_val = 0;
         
-        // CSR Read Switch (MODIFIED FOR TASK 2 & 3)
+        // CSR Read Switch
         switch (csr_addr) {
             case 0x305: csr_read_val = csr_mtvec; break;
             case 0x340: csr_read_val = csr_mscratch; break; // mscratch
@@ -483,6 +495,22 @@ ap_int<32> execute() {
                     trap_cause = 11; 
                 } // ECALL
                 else if (ID_EX_imm == 0x001) { EX_MEM_is_trap = true; trap_cause = 3; } // EBREAK
+                else if (ID_EX_imm == 0x105) { // WFI (Wait For Interrupt)
+                    // 1. Check the Enable Bits
+                    bool global_enable = (csr_mstatus >> 3) & 1;
+                    bool timer_enable  = (csr_mie >> 7) & 1;
+
+                    // 2. Apply the Nudge
+                    if (csr_mcycle > 500000) { 
+                        mtimecmp = (ap_uint<64>)csr_mcycle + 100;
+                        
+                        // 3. Print the diagnostic info
+                        std::cout << "[SIM-HACK] WFI at Cycle " << std::hex << (uint64_t)csr_mcycle 
+                                  << " | MIE (Global): " << (int)global_enable 
+                                  << " | MTIE (Timer): " << (int)timer_enable 
+                                  << std::dec << std::endl << std::flush;
+                    }
+                }
                 else if (ID_EX_imm == 0x302) { // MRET
                     // 1. Restore PC from MEPC
                     next_pc = (ap_uint<32>)csr_mepc;
@@ -519,7 +547,15 @@ ap_int<32> execute() {
                 EX_MEM_alu_result = csr_read_val; 
                 EX_MEM_reg_write = (ID_EX_rd != 0);
                 if (ID_EX_rs1 != 0) { 
-                    ap_uint<32> new_val = csr_read_val | rs1_val; 
+                    ap_uint<32> new_val = csr_read_val | rs1_val;
+
+                    //if (csr_addr == 0x300 || csr_addr == 0x304) {
+                    //     std::cout << "[CSR-WRITE] Addr: 0x" << std::hex << csr_addr 
+                    //               << " | Old: 0x" << (uint32_t)csr_read_val 
+                    //               << " | New: 0x" << (uint32_t)new_val 
+                    //               << std::dec << std::endl << std::flush;
+                    //}
+
                     switch (csr_addr) {
                         case 0x305: csr_mtvec = new_val; break;
                         case 0x340: csr_mscratch = new_val; break; // mscratch
@@ -652,8 +688,8 @@ ap_int<32> memory(volatile uint32_t* ram) {
     MEM_WB_reg_write = EX_MEM_reg_write;
 
     unsigned ea_u  = (unsigned)EX_MEM_alu_result; 
-    unsigned phys_ea = ea_u & 0x000FFFFF; 
-    unsigned d_idx = (phys_ea - (DRAM_BASE & 0x000FFFFF)) >> 2;
+    unsigned phys_ea = ea_u & 0x07FFFFFF; 
+    unsigned d_idx = (phys_ea - (DRAM_BASE & 0x07FFFFFF)) >> 2;
     unsigned byte_off = phys_ea & 0x3;
 
     // =============================================================
@@ -720,8 +756,20 @@ ap_int<32> memory(volatile uint32_t* ram) {
     // =============================================================
     else if (EX_MEM_mem_read) {
         // ----------------------------------------------------------------
-        // MMIO READ: CLINT (Timer)
+        // MMIO READ: UART Sniffer
         // ----------------------------------------------------------------
+        if ((ea_u & 0xFFFFF000) == 0x10000000) {
+            // Default to "Ready" (0x60) for ANY status register read
+            // This tricks the kernel regardless of where it looks (0x05, 0x14, etc.)
+            MEM_WB_value = 0x60; 
+            MEM_WB_reg_write = true;
+            
+            #ifdef __SYNTHESIS__
+            #else
+                //std::cout << "[UART-DEBUG] Read from 0x" << std::hex << ea_u << std::dec << "\n";
+            #endif
+            return MEM_WB_value;
+        }
         // mtimecmp (0x2004000) - Timer Compare Register
         if (phys_ea == 0x2004000) {
             MEM_WB_value = (ap_int<32>)(mtimecmp & 0xFFFFFFFF); // Low 32 bits
@@ -784,19 +832,29 @@ ap_int<32> memory(volatile uint32_t* ram) {
     else if (EX_MEM_mem_write) {
         // Any standard write invalidates a Load Reservation
         lr_valid = false;
+        // ----------------------------------------------------------------
+        // MMIO: UART Write Sniffer (Debugs ALL 0x44A... writes)
+        // ----------------------------------------------------------------
+        if ((ea_u & 0xFFFFF000) == 0x10000000) { 
+            #ifdef __SYNTHESIS__
+            #else
+                // Print the details of ANY write to this region
+                //std::cout << "[UART-DEBUG] Write to 0x" << std::hex << ea_u 
+                //        << " Val=0x" << EX_MEM_store_val << std::dec << "\n";
 
-        // ----------------------------------------------------------------
-        // MMIO: UART (0x10000000) (TASK 4 ADDITION)
-        // ----------------------------------------------------------------
-        if (phys_ea == 0x10000000) { 
-            char c = (char)(EX_MEM_store_val & 0xFF);
-            std::cout << c << std::flush; // Print directly to HLS simulation terminal
-            // Do NOT write to RAM
-            return MEM_WB_value; 
+                // If it's a write to the Data Register (Base or Base+4?), print char
+                // We verify both 0x00 (Byte mode) and 0x00 (Word mode)
+                if ((ea_u & 0xFF) == 0x00) {
+                    char c = (char)(EX_MEM_store_val & 0xFF);
+                    std::cout << c << std::flush; 
+                }
+            #endif
+            MEM_WB_reg_write = false; 
+            return 0;
         }
 
         // ----------------------------------------------------------------
-        // MMIO: CLINT (Timer Compare) (TASK 4 ADDITION)
+        // MMIO: CLINT (Timer Compare)
         // ----------------------------------------------------------------
         // Lower 32-bits of mtimecmp
         if (phys_ea == 0x2004000) {
@@ -905,7 +963,20 @@ void riscv_step(volatile uint32_t* ram, int* cycles_output) {
         csr_mcycle++;   // Always increment cycles
         csr_minstret++;
 
-        // ------------------ INTERRUPT LOGIC (TASK 3 ADDITION) ------------------
+        // --- HEARTBEAT ---
+        // Inside your loop
+        if (csr_mcycle % 1000000 == 0) {
+            #ifdef __SYNTHESIS__
+            // Do nothing
+            #else
+            std::cout << "Cycle: " << std::dec << csr_mcycle 
+                        << " | PC: 0x" << std::hex << pc 
+                        << " | Instr: 0x" << IF_ID_instr << std::endl;
+            #endif
+        }
+        // ------------------------------------
+
+        // ------------------ INTERRUPT LOGIC  ------------------
         // 1. Check Timer Match (Casting mcycle to 64-bit for comparison)
         bool timer_irq = ((ap_uint<64>)csr_mcycle >= mtimecmp);
 
