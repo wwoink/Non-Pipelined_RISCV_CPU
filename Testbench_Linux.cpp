@@ -114,7 +114,7 @@ int main() {
     int step_count = 0;
     int core_cycles = 0; // Dummy variable to catch the cycle count output
 
-    riscv_step((volatile uint32_t*)ram, &core_cycles);
+    riscv_step((volatile uint32_t*)ram, 10000000, &core_cycles);
 
     return 0;
 }

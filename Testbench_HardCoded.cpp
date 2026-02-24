@@ -24,7 +24,7 @@
 #define ELF_PATH "I:/Vitis_Files/Pipeline_Tests/Global_Core_Revised/Benchmarks/rv32ui-p-benchmarks/m-ext/multiply.riscv"
 
 // 2. Debug Switches
-const bool ENABLE_CORE_DEBUG = true;
+const bool ENABLE_CORE_DEBUG = false;
 const bool ENABLE_MEMORY_INSPECTION = false; 
 
 // ============================================================================
@@ -34,7 +34,7 @@ ap_uint<32> ram[RAM_SIZE];
 
 extern void riscv_init();
 // UPDATED SIGNATURE: Now accepts the cycle count
-extern void riscv_step(volatile uint32_t* ram, int* cycles_output);
+extern void riscv_step(volatile uint32_t* ram, int max_cycles, int* cycles_output);
 
 int main(int argc, char* argv[])
 {
@@ -79,7 +79,7 @@ int main(int argc, char* argv[])
 
     // Single Call to Hardware
     // The hardware will loop internally until it hits the ecall
-    riscv_step((volatile uint32_t*)ram, &final_cycle_count);
+    riscv_step((volatile uint32_t*)ram, 500000, &final_cycle_count);
 
     // [MODIFIED] Print the Result
     std::cout << "--------------------------------------------------\n";
